@@ -2,12 +2,12 @@ import os
 import glob
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import numpy as np
+import yaml
+import argparse
 from dataloader import create_dataloader
 from sklearn.cluster import KMeans
-from sklearn.metrics import pairwise_distances_argmin_min
-from collections import defaultdict, Counter
+from collections import Counter
 from transformers import XCLIPVisionModel
 
 class XCLIP(nn.Module):
@@ -26,6 +26,11 @@ class XCLIP(nn.Module):
         video_level_features = self.fc_norm(sequence_output.mean(1))  # 计算视频级别的特征
 
         return video_level_features
+
+def get_arguments():
+    parser = argparse.ArgumentParser(description="Training script")
+    parser.add_argument('--config', type=str, required=True, help="Path to the configuration file")
+    return parser.parse_args()
 
 def process_csv_files_in_directory(directory, batch_size=8, num_workers=4):
     csv_files = glob.glob(os.path.join(directory, "*.csv"))
@@ -46,7 +51,6 @@ def process_csv_files_in_directory(directory, batch_size=8, num_workers=4):
 
         with torch.no_grad():
             for idx, frames in dataloader:
-                # frames = frames.cuda()  # 如果使用 GPU，确保数据加载到 GPU 上
                 features = model(frames)  # 提取视频级别的特征
                 video_features.append(features.cpu().numpy())
 
@@ -81,22 +85,55 @@ def classify_videos(all_video_features, cluster_num=5):
 
     return method_clusters
 
-def main(csv_directory):
-    # 从 CSV 文件提取所有视频的特征
-    all_video_features = process_csv_files_in_directory(csv_directory, batch_size=8, num_workers=8)
+def evaluate_clustering_score(all_video_features, cluster_num):
+    # 将所有特征整合成一个数组
+    all_features = np.concatenate(list(all_video_features.values()), axis=0)
     
-    # 假设初步聚类数目
-    cluster_num = 5  # 初始聚类数量，可以根据实际情况调整
+    # 使用 KMeans 进行聚类
+    kmeans = KMeans(n_clusters=cluster_num, random_state=0)
+    kmeans.fit(all_features)
     
-    # 对视频进行分类，并确定每个方法的类别
-    method_clusters = classify_videos(all_video_features, cluster_num)
+    # 聚类内距离 (WCSS)
+    score = kmeans.inertia_
     
-    # 输出聚类结果
-    for method_name, cluster_info in method_clusters.items():
-        print(f"Method: {method_name}, Predicted Cluster: {cluster_info['predicted_cluster']}, Label Counts: {cluster_info['label_counts']}")
+    # WCSS 越小越好，因此直接返回
+    return score
 
-    return method_clusters
+def main(csv_directory, batch_size, num_workers):
+    
+    # 从 CSV 文件提取所有视频的特征
+    all_video_features = process_csv_files_in_directory(csv_directory, batch_size, num_workers)
+    
+    best_cluster_num = None
+    best_score = float('inf')  # WCSS 越小越好
+
+    # 聚类数目从 2 到 20，找到最佳聚类数目
+    for cluster_num in range(2, 21):
+        method_clusters = classify_videos(all_video_features, cluster_num)
+        
+        score = evaluate_clustering_score(all_video_features, cluster_num)  # 计算聚类效果
+        
+        if score < best_score:
+            best_score = score
+            best_cluster_num = cluster_num
+        
+        print(f"Cluster Num: {cluster_num}, Score: {score}")
+        for method_name, cluster_info in method_clusters.items():
+            print(f"Method: {method_name}, Predicted Cluster: {cluster_info['predicted_cluster']}, Label Counts: {cluster_info['label_counts']}")
+        print("\n")
+    
+    print(f"Best Cluster Num: {best_cluster_num} with score: {best_score}")
+    return best_cluster_num
 
 if __name__ == "__main__":
-    csv_directory = '/vhome/lixinghan/share-data/Gen-Video/datasets/val_csv'
-    method_clusters = main(csv_directory)
+    
+    # 接受命令行参数
+    args = get_arguments()
+    assert os.path.exists(args.config), "Configuration file not found"
+    config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    
+    csv_directory = config['csv_directory']
+    batch_size = config['batch_size']
+    num_workers = config['num_workers']
+    
+    best_cluster_num= main(csv_directory, batch_size, num_workers)
